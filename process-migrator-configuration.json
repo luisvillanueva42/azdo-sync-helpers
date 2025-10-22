@@ -1,0 +1,13 @@
+{
+    "sourceAccountUrl": "https://dev.azure.com/STMN-Group",
+    "sourceAccountToken": "EgN2OBEX8wzapQpfBjKqVPvnCzl3ohpQHTzdUYzufoBsOBp40LvUJQQJ99BIACAAAAABgmZbAAAGAZDOHls2",
+    "targetAccountUrl": "https://dev.azure.com/STMN-Group-DEV",
+    "targetAccountToken": "EgN2OBEX8wzapQpfBjKqVPvnCzl3ohpQHTzdUYzufoBsOBp40LvUJQQJ99BIACAAAAABgmZbAAAGAZDOHls2",
+    "sourceProcessName": "Agile Straumann",
+    "targetProcessName": "Agile Straumann",
+    "options": {
+        "overwritePicklist": true,
+        "continueOnRuleImportFailure": true,
+        "skipImportFormContributions": true
+    }
+}

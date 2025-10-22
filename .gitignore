@@ -1,0 +1,30 @@
+# Node.js
+node_modules/
+dist/
+
+# TypeScript
+*.tsbuildinfo
+
+# Logs
+*.log
+output/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Environment files
+.env
+.env.local
+
+# VS Code
+.vscode/
+
+# Process migrator output
+process.json
+processMigrator.log
+
+# Others
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

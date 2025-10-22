@@ -1,0 +1,32 @@
+{
+  "name": "azdo-sync-helpers",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "list-projects": "ts-node src/sync-projects.ts list",
+    "copy-projects": "ts-node src/copy-interactive.ts",
+    "migrate-process": "ts-node src/update-process-config.ts && process-migrator --mode=migrate --config=process-migrator-configuration.json"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "ts-node": {
+    "esm": true,
+    "experimentalSpecifiers": true,
+    "preferTsExts": true
+  },
+  "devDependencies": {
+    "@types/inquirer": "^9.0.9",
+    "@types/node": "^24.9.1",
+    "inquirer": "^8.2.5",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "jsonc-parser": "^3.3.1",
+    "process-migrator": "^0.10.1"
+  }
+}
