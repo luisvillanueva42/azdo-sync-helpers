@@ -1,7 +1,11 @@
 import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
 import { config } from './config.ts';
+import { checkOrgAccess } from './auth.ts';
+import inquirer from 'inquirer';
+import { writeFileSync, readFileSync } from 'fs';
 
-const {
+let {
     AZDO_PAT,
     SOURCE_ORG,
     TARGET_ORG,
@@ -9,15 +13,100 @@ const {
     DRY_RUN
 } = config;
 
+async function ensureValidPAT(org: string): Promise<string> {
+    let pat = AZDO_PAT;
+    
+    // Check if PAT is empty or invalid
+    if (!pat) {
+        const answer = await inquirer.prompt([
+            {
+                type: 'password',
+                name: 'pat',
+                message: 'Enter your Azure DevOps Personal Access Token (PAT):',
+                mask: '*'
+            }
+        ]);
+        pat = answer.pat;
+    }
+
+    // Test PAT against the organization
+    const API_VER = '7.1';
+    const AUTH = 'Basic ' + Buffer.from(':' + pat).toString('base64');
+    const headers = { Authorization: AUTH };
+    
+    try {
+        const url = new URL(`https://dev.azure.com/${org}/_apis/work/processes`);
+        url.searchParams.set('api-version', API_VER);
+        const res = await fetch(url, { headers });
+        
+        if (!res.ok) {
+            if (res.status === 401 || res.status === 403) {
+                // PAT is invalid, prompt for new one
+                const answer = await inquirer.prompt([
+                    {
+                        type: 'password',
+                        name: 'pat',
+                        message: 'Invalid PAT. Enter a valid Azure DevOps Personal Access Token (PAT):',
+                        mask: '*'
+                    }
+                ]);
+                pat = answer.pat;
+                
+                // Test the new PAT
+                const newAuth = 'Basic ' + Buffer.from(':' + pat).toString('base64');
+                const newHeaders = { Authorization: newAuth };
+                const newRes = await fetch(url, { headers: newHeaders });
+                
+                if (!newRes.ok) {
+                    throw new Error(`PAT is still invalid for organization ${org}. Status: ${newRes.status}`);
+                }
+            } else {
+                throw new Error(`Error accessing ${org}: ${res.status} ${res.statusText}`);
+            }
+        }
+    } catch (err) {
+        if (err instanceof Error && err.message.includes('PAT is still invalid')) {
+            throw err;
+        }
+        throw new Error(`Network error accessing ${org}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    // Save PAT to config.ts if it was newly provided or changed
+    if (pat !== AZDO_PAT && pat) {
+        try {
+            const __filename = fileURLToPath(import.meta.url);
+            const __dirname = dirname(__filename);
+            const configPath = join(__dirname, 'config.ts');
+            let configText = readFileSync(configPath, 'utf-8');
+            configText = configText.replace(/AZDO_PAT:\s*['\"][^'\"]*['\"]/, `AZDO_PAT: '${pat}'`);
+            writeFileSync(configPath, configText);
+            AZDO_PAT = pat;
+            config.AZDO_PAT = pat;
+        } catch (err) {
+            console.warn('Warning: Could not update config.ts with new PAT:', err);
+        }
+    }
+
+    return pat;
+}
+
 if (!AZDO_PAT) {
     console.error('Missing AZDO_PAT environment variable');
-    process.exit(1);
+    // Don't exit here, let ensureValidPAT handle it
 }
 
 const API_VER = '7.1';
-const AUTH = 'Basic ' + Buffer.from(':' + AZDO_PAT).toString('base64');
-const headers = { Authorization: AUTH };
-const headersJson = { ...headers, 'Content-Type': 'application/json' };
+
+async function getHeaders(org?: string): Promise<{ Authorization: string; 'Content-Type'?: string }> {
+    const pat = org ? await ensureValidPAT(org) : AZDO_PAT || '';
+    const AUTH = 'Basic ' + Buffer.from(':' + pat).toString('base64');
+    return { Authorization: AUTH };
+}
+
+async function getHeadersJson(org?: string): Promise<{ Authorization: string; 'Content-Type': string }> {
+    const headers = await getHeaders(org);
+    return { ...headers, 'Content-Type': 'application/json' };
+}
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -61,6 +150,11 @@ export async function listProjects(org: string): Promise<Project[]> {
     const results: Project[] = [];
     let token: string | null = null;
 
+    // Ensure we have a valid PAT
+    const validPAT = await ensureValidPAT(org);
+    const AUTH = 'Basic ' + Buffer.from(':' + validPAT).toString('base64');
+    const headers = { Authorization: AUTH };
+
     do {
         const url = new URL(`https://dev.azure.com/${org}/_apis/projects`);
         url.searchParams.set('stateFilter', 'wellFormed');
@@ -80,6 +174,7 @@ export async function listProjects(org: string): Promise<Project[]> {
 }
 
 async function getProjectWithCapabilities(org: string, idOrName: string): Promise<ProjectCapabilities> {
+    const headers = await getHeaders(org);
     const url = new URL(`https://dev.azure.com/${org}/_apis/projects/${encodeURIComponent(idOrName)}`);
     url.searchParams.set('includeCapabilities', 'true');
     url.searchParams.set('api-version', API_VER);
@@ -91,6 +186,11 @@ async function getProjectWithCapabilities(org: string, idOrName: string): Promis
 }
 
 export async function listProcesses(org: string): Promise<Process[]> {
+    // Ensure we have a valid PAT
+    const validPAT = await ensureValidPAT(org);
+    const AUTH = 'Basic ' + Buffer.from(':' + validPAT).toString('base64');
+    const headers = { Authorization: AUTH };
+    
     const url = new URL(`https://dev.azure.com/${org}/_apis/work/processes`);
     url.searchParams.set('api-version', API_VER);
 
@@ -102,6 +202,7 @@ export async function listProcesses(org: string): Promise<Process[]> {
 }
 
 async function queueCreateProject(org: string, name: string, description: string, processTypeId: string, visibility: string): Promise<string | null> {
+    const headersJson = await getHeadersJson(org);
     const url = new URL(`https://dev.azure.com/${org}/_apis/projects`);
     url.searchParams.set('api-version', API_VER);
 
@@ -130,6 +231,7 @@ async function queueCreateProject(org: string, name: string, description: string
 }
 
 async function waitForOperation(org: string, opId: string, timeoutMs = 10 * 60 * 1000): Promise<void> {
+    const headers = await getHeaders(org);
     const start = Date.now();
     while (true) {
         const url = new URL(`https://dev.azure.com/${org}/_apis/operations/${opId}`);
@@ -151,6 +253,7 @@ async function waitForOperation(org: string, opId: string, timeoutMs = 10 * 60 *
 }
 
 async function deleteProject(org: string, projectId: string): Promise<void> {
+    const headers = await getHeaders(org);
     const url = new URL(`https://dev.azure.com/${org}/_apis/projects/${projectId}`);
     url.searchParams.set('api-version', API_VER);
 
@@ -186,6 +289,10 @@ export async function listSourceProjects(): Promise<void> {
         console.error('Missing SOURCE_ORG in .env');
         process.exit(1);
     }
+    
+    // Ensure we have a valid PAT before proceeding
+    const validPAT = await ensureValidPAT(SOURCE_ORG);
+    
     const projects = await listProjects(SOURCE_ORG);
     console.log(JSON.stringify(projects, null, 2));
 }
