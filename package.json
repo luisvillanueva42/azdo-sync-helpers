@@ -4,9 +4,11 @@
   "description": "",
   "main": "index.js",
   "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
     "list-projects": "ts-node src/sync-projects.ts list",
     "copy-projects": "ts-node src/copy-interactive.ts",
-    "migrate-process": "ts-node src/update-process-config.ts && process-migrator --mode=migrate --config=process-migrator-configuration.json"
+    "migrate-process": "ts-node src/update-process-config.ts && process-migrator --mode=migrate --config=process-migrator-configuration.json",
+    "copy-workitems": "ts-node src/copy-workitems.ts"
   },
   "keywords": [],
   "author": "",
