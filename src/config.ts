@@ -2,7 +2,7 @@
  * Default configuration values and environment variable handling
  */
 export const config = {
-    AZDO_PAT: 'G0DXVqg5t5sMdS4b1Pwf9NFNGjcMFh4BHETzH3H06aYveRYNqotEJQQJ99BJACAAAAABgmZbAAAGAZDO1BCz',
+    AZDO_PAT: 'Ezr3HP4NJg8EWBzR7QMZCCwKGW10NogAZHCHMTKKDimlBzDkW5f9JQQJ99BJACAAAAABgmZbAAAGAZDO24Tk',
     SOURCE_ORG: 'STMN-Group',
     TARGET_ORG: 'STMN-Group-DEV',
     VISIBILITY: 'private',
