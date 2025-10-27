@@ -586,27 +586,48 @@ async function executeWiqlQuery(org: string, project: string, wiql: string): Pro
 
     if (!res.ok) {
         const errorText = await res.text();
+        console.log('Url:', url.toString());
+        console.log('WIQL Query:', wiql);
+        
         throw new Error(`Execute WIQL query failed (${org}/${project}): ${res.status} ${errorText}`);
     }
 
     return res.json();
 }
 
-// Get multiple work items by IDs
+// Get multiple work items by IDs (splits into batches of max 190 to stay under 200 ID limit)
 async function getWorkItemsBatch(org: string, project: string, ids: number[]): Promise<WorkItem[]> {
     if (ids.length === 0) return [];
     
-    const headers = await getHeaders(org);
-    const url = new URL(`https://dev.azure.com/${org}/${project}/_apis/wit/workitems`);
-    url.searchParams.set('ids', ids.join(','));
-    url.searchParams.set('$expand', 'relations');
-    url.searchParams.set('api-version', API_VER);
+    const MAX_BATCH_SIZE = 190; // Stay under the 200 ID limit
+    const allWorkItems: WorkItem[] = [];
+    
+    // Split IDs into batches of max 190
+    for (let i = 0; i < ids.length; i += MAX_BATCH_SIZE) {
+        const batchIds = ids.slice(i, i + MAX_BATCH_SIZE);
+        
+        const headers = await getHeaders(org);
+        const url = new URL(`https://dev.azure.com/${org}/${project}/_apis/wit/workitems`);
+        url.searchParams.set('ids', batchIds.join(','));
+        url.searchParams.set('$expand', 'relations');
+        url.searchParams.set('api-version', API_VER);
 
-    const res = await fetch(url, { headers });
-    if (!res.ok) throw new Error(`Get work items batch (${org}/${project}): ${res.statusText}`);
+        const res = await fetch(url, { headers });
+        if (!res.ok) throw new Error(`Get work items batch (${org}/${project}): ${res.statusText}`);
 
-    const body = await res.json();
-    return body.value || [];
+        const body = await res.json();
+        const batchWorkItems = body.value || [];
+        allWorkItems.push(...batchWorkItems);
+        
+        // Log progress for large batches
+        if (ids.length > MAX_BATCH_SIZE) {
+            const batchNum = Math.floor(i / MAX_BATCH_SIZE) + 1;
+            const totalBatches = Math.ceil(ids.length / MAX_BATCH_SIZE);
+            console.log(`   📦 Fetched batch ${batchNum}/${totalBatches} (${batchWorkItems.length} work items)`);
+        }
+    }
+    
+    return allWorkItems;
 }
 
 // Get Epic and all its child work items using WIQL query for better performance
@@ -690,7 +711,7 @@ async function getChildWorkItems(org: string, project: string, parentId: number)
     return children;
 }
 
-// Create work item in target project
+// Create work item in target project with retry logic for identity field errors
 async function createWorkItem(org: string, project: string, workItemType: string, fields: { [key: string]: any }, includeStateFields: boolean = false): Promise<WorkItem> {
     const headers = await getHeadersJson(org);
     const url = new URL(`https://dev.azure.com/${org}/${project}/_apis/wit/workitems/$${workItemType}`);
@@ -698,18 +719,22 @@ async function createWorkItem(org: string, project: string, workItemType: string
 
     // Convert fields to patch format, filtering out null/undefined values
     // Conditionally exclude System.State and System.Reason based on includeStateFields parameter
-    const patchDocument = Object.entries(fields)
-        .filter(([field, value]) => 
-            value !== null && 
-            value !== undefined && 
-            value !== '' &&
-            (includeStateFields || (field !== 'System.State' && field !== 'System.Reason'))
-        )
-        .map(([field, value]) => ({
-            op: 'add',
-            path: `/fields/${field}`,
-            value: value
-        }));
+    const createPatchDocument = (fieldsToUse: { [key: string]: any }) => {
+        return Object.entries(fieldsToUse)
+            .filter(([field, value]) => 
+                value !== null && 
+                value !== undefined && 
+                value !== '' &&
+                (includeStateFields || (field !== 'System.State' && field !== 'System.Reason'))
+            )
+            .map(([field, value]) => ({
+                op: 'add',
+                path: `/fields/${field}`,
+                value: value
+            }));
+    };
+
+    let patchDocument = createPatchDocument(fields);
 
     // Debug: Log the fields being sent
     // console.log(`   📋 Fields to create (${patchDocument.length} fields):`, 
@@ -723,6 +748,59 @@ async function createWorkItem(org: string, project: string, workItemType: string
 
     if (!res.ok) {
         const errorText = await res.text();
+        
+        // Check if this is an identity field error
+        let errorData: any = null;
+        try {
+            errorData = JSON.parse(errorText);
+        } catch (parseError) {
+            // If we can't parse the error, throw the original error
+            console.error(`   🔍 Failed request details:`);
+            console.error(`   URL: ${url.toString()}`);
+            console.error(`   Fields sent:`, JSON.stringify(patchDocument, null, 2));
+            throw new Error(`Create work item failed (${org}/${project}): ${res.status} ${errorText}`);
+        }
+
+        // Check if this is a WorkItemFieldInvalidException for an identity field
+        if (errorData && 
+            errorData.typeKey === 'WorkItemFieldInvalidException' && 
+            errorData.customProperties && 
+            errorData.customProperties.ReferenceName &&
+            errorData.message && 
+            errorData.message.includes('unknown identity')) {
+            
+            const problematicField = errorData.customProperties.ReferenceName;
+            console.warn(`   ⚠️  Identity field error detected for field: ${problematicField}`);
+            console.warn(`   🔄 Retrying without the problematic identity field...`);
+            
+            // Remove the problematic field and retry
+            const fieldsWithoutProblematic = { ...fields };
+            delete fieldsWithoutProblematic[problematicField];
+            
+            // Create new patch document without the problematic field
+            patchDocument = createPatchDocument(fieldsWithoutProblematic);
+            
+            console.log(`   🔄 Retrying with ${patchDocument.length} fields (removed ${problematicField})`);
+            
+            const retryRes = await fetch(url, {
+                method: 'POST',
+                headers: { ...headers, 'Content-Type': 'application/json-patch+json' },
+                body: JSON.stringify(patchDocument)
+            });
+            
+            if (!retryRes.ok) {
+                const retryErrorText = await retryRes.text();
+                console.error(`   🔍 Retry failed - request details:`);
+                console.error(`   URL: ${url.toString()}`);
+                console.error(`   Fields sent:`, JSON.stringify(patchDocument, null, 2));
+                throw new Error(`Create work item retry failed (${org}/${project}): ${retryRes.status} ${retryErrorText}`);
+            }
+            
+            console.log(`   ✅ Successfully created work item after removing identity field: ${problematicField}`);
+            return retryRes.json();
+        }
+        
+        // If it's not an identity error, throw the original error
         console.error(`   🔍 Failed request details:`);
         console.error(`   URL: ${url.toString()}`);
         console.error(`   Fields sent:`, JSON.stringify(patchDocument, null, 2));
