@@ -151,7 +151,8 @@ interface CopyConfig {
     epicId: number;
     skipMissingTypes: boolean;
     useDefaultValues: boolean;
-    addMissingUsers: boolean;
+    userAccessLevel: 'none' | 'stakeholder' | 'basic'; // How to handle missing users
+    typeMappings: Map<string, string>; // Map from source type to target type
 }
 
 interface WiqlQuery {
@@ -313,8 +314,8 @@ async function checkUserInOrganization(org: string, userEmail: string): Promise<
     }
 }
 
-// Add user as stakeholder to target organization
-async function addUserAsStakeholder(org: string, userEmail: string, displayName: string): Promise<boolean> {
+// Add user to target organization
+async function addUser(org: string, userEmail: string, displayName: string, accountLicenseType: string = "stakeholder"): Promise<boolean> {
     try {
         const headers = await getHeadersJson(org);
         const url = new URL(`https://vsaex.dev.azure.com/${org}/_apis/userentitlements`);
@@ -322,7 +323,7 @@ async function addUserAsStakeholder(org: string, userEmail: string, displayName:
 
         const payload = {
             accessLevel: {
-                accountLicenseType: "stakeholder"
+                accountLicenseType: accountLicenseType || "stakeholder"
             },
             user: {
                 principalName: userEmail,
@@ -337,15 +338,25 @@ async function addUserAsStakeholder(org: string, userEmail: string, displayName:
         });
 
         if (res.ok) {
-            console.log(`   ✅ Added ${displayName} (${userEmail}) as stakeholder to ${org}`);
+            const responseBody = await res.json();
+            
+            // Check if the response indicates success
+            if (responseBody.isSuccess === false || responseBody.operationResult?.isSuccess === false) {
+                const errors = responseBody.operationResult?.errors || responseBody.errors || [];
+                const errorMessages = errors.map((err: any) => err.value || err.message || err).join(', ');
+                console.warn(`   ⚠️  Could not add ${displayName} (${userEmail}) as a ${accountLicenseType} user: ${errorMessages}`);
+                return false;
+            }
+
+            console.log(`   ✅ Added ${displayName} (${userEmail}) as a ${accountLicenseType} user to ${org}`);
             return true;
         } else {
             const errorText = await res.text();
-            console.warn(`   ⚠️  Could not add ${displayName} (${userEmail}) as stakeholder: ${res.status} ${errorText}`);
+            console.warn(`   ⚠️  Could not add ${displayName} (${userEmail}) as a ${accountLicenseType} user: ${res.status} ${errorText}`);
             return false;
         }
     } catch (error) {
-        console.warn(`   ⚠️  Error adding ${displayName} (${userEmail}) as stakeholder:`, error);
+        console.warn(`   ⚠️  Error adding ${displayName} (${userEmail}) as a ${accountLicenseType} user:`, error);
         return false;
     }
 }
@@ -387,12 +398,14 @@ function extractIdentityInfo(fieldValue: any): IdentityRef | null {
     return null;
 }
 
+
 // Process identity fields and manage user access
 async function processIdentityFields(
     fields: { [key: string]: any },
     targetOrg: string,
     addMissingUsers: boolean,
-    fieldDefinitions: WorkItemFieldDefinition[]
+    fieldDefinitions: WorkItemFieldDefinition[],
+    userAccessLevel: 'none' | 'stakeholder' | 'basic' = 'none'
 ): Promise<{ [key: string]: any }> {
     const processedFields = { ...fields };
     
@@ -420,8 +433,8 @@ async function processIdentityFields(
         if (!userExists) {
             console.log(`   ⚠️  User ${identity.displayName} not found in ${targetOrg}`);
             
-            if (addMissingUsers) {
-                const added = await addUserAsStakeholder(targetOrg, identity.uniqueName, identity.displayName);
+            if (addMissingUsers && userAccessLevel !== 'none') {
+                const added = await addUser(targetOrg, identity.uniqueName, identity.displayName, userAccessLevel);
                 if (!added) {
                     // Remove the identity field if we couldn't add the user
                     console.log(`   🔄 Removing identity field ${fieldName} due to access issues`);
@@ -1278,7 +1291,8 @@ async function getCopyConfig(): Promise<CopyConfig> {
         epicId: projectAnswers.epicId,
         skipMissingTypes: false,
         useDefaultValues: false,
-        addMissingUsers: false
+        userAccessLevel: 'none' as const,
+        typeMappings: new Map<string, string>()
     };
 }
 
@@ -1316,20 +1330,65 @@ async function copyEpicAndChildren(): Promise<void> {
 
         if (missingTypes.length > 0) {
             console.log(`⚠️  Missing work item types in target project: ${missingTypes.join(', ')}`);
-            const { skipMissing } = await inquirer.prompt([
-                {
-                    type: 'confirm',
-                    name: 'skipMissing',
-                    message: 'Do you want to skip work items with missing types?',
-                    default: true
-                }
-            ]);
+            
+            // For each missing type, ask what to do
+            for (const missingType of missingTypes) {
+                const workItemsOfThisType = allWorkItems.filter(wi => wi.fields['System.WorkItemType'] === missingType);
+                console.log(`\n📋 Found ${workItemsOfThisType.length} work items of type "${missingType}":`);
+                workItemsOfThisType.forEach((wi, index) => {
+                    const title = wi.fields['System.Title'] || 'No title';
+                    console.log(`   ${index + 1}. ID: ${wi.id} - ${title}`);
+                });
 
-            if (!skipMissing) {
-                console.log('❌ Copy cancelled. Please ensure all work item types exist in the target project.');
-                return;
+                const { action } = await inquirer.prompt([
+                    {
+                        type: 'list',
+                        name: 'action',
+                        message: `What would you like to do with work items of type "${missingType}"?`,
+                        choices: [
+                            { name: 'Skip these work items', value: 'skip' },
+                            { name: 'Migrate to another work item type', value: 'migrate' }
+                        ],
+                        default: 'skip'
+                    }
+                ]);
+
+                if (action === 'migrate') {
+                    // Show available target types for migration
+                    const targetTypeChoices = targetTypes
+                        .filter(t => !t.isDisabled)
+                        .map(t => ({ 
+                            name: `${t.name} - ${t.description || 'No description'}`, 
+                            value: t.name 
+                        }))
+                        .sort((a, b) => a.value.localeCompare(b.value));
+
+                    const { targetType } = await inquirer.prompt([
+                        {
+                            type: 'list',
+                            name: 'targetType',
+                            message: `Select target work item type to migrate "${missingType}" to:`,
+                            choices: targetTypeChoices
+                        }
+                    ]);
+
+                    console.log(`✅ Will migrate "${missingType}" to "${targetType}"`);
+                    copyConfig.typeMappings.set(missingType, targetType);
+                } else {
+                    console.log(`⏭️  Will skip work items of type "${missingType}"`);
+                    copyConfig.skipMissingTypes = true;
+                }
             }
-            copyConfig.skipMissingTypes = true;
+
+            // If user chose to skip all missing types and no mappings were created
+            if (copyConfig.skipMissingTypes && copyConfig.typeMappings.size === 0) {
+                console.log('⏭️  All missing types will be skipped');
+            } else if (copyConfig.typeMappings.size > 0) {
+                console.log('\n📋 Type mappings created:');
+                copyConfig.typeMappings.forEach((targetType, sourceType) => {
+                    console.log(`   ${sourceType} → ${targetType}`);
+                });
+            }
         }
 
         // Check for required fields and ask about defaults
@@ -1342,27 +1401,44 @@ async function copyEpicAndChildren(): Promise<void> {
                 default: true
             },
             {
-                type: 'confirm',
-                name: 'addMissingUsers',
-                message: 'Add users as stakeholders to target organization if they don\'t have access?',
-                default: true
+                type: 'list',
+                name: 'userAccessLevel',
+                message: 'How should missing users be handled in the target organization?',
+                choices: [
+                    { name: 'Do not add users (remove identity fields)', value: 'none' },
+                    { name: 'Add users as Basic users (Org requires license)', value: 'basic' },
+                    { name: 'Add users as Stakeholders (no license required)', value: 'stakeholder' }
+                ],
+                default: 'stakeholder'
             }
         ]);
         copyConfig.useDefaultValues = fieldPrompts.useDefaults;
-        copyConfig.addMissingUsers = fieldPrompts.addMissingUsers;
+        copyConfig.userAccessLevel = fieldPrompts.userAccessLevel;
 
         // Show summary and confirm
-        const workItemsToProcess = copyConfig.skipMissingTypes 
-            ? allWorkItems.filter(wi => targetTypeNames.has(wi.fields['System.WorkItemType']))
-            : allWorkItems;
+        const workItemsToProcess = allWorkItems.filter(wi => {
+            const originalType = wi.fields['System.WorkItemType'];
+            // Include if type exists in target OR if there's a mapping for it
+            return targetTypeNames.has(originalType) || copyConfig.typeMappings.has(originalType);
+        });
 
         console.log('\n📊 Copy Summary:');
         console.log(`Work items to copy: ${workItemsToProcess.length}`);
-        if (copyConfig.skipMissingTypes && missingTypes.length > 0) {
+        if (copyConfig.skipMissingTypes) {
             console.log(`Work items to skip (missing types): ${allWorkItems.length - workItemsToProcess.length}`);
         }
+        if (copyConfig.typeMappings.size > 0) {
+            console.log('Type mappings:');
+            copyConfig.typeMappings.forEach((targetType, sourceType) => {
+                const count = allWorkItems.filter(wi => wi.fields['System.WorkItemType'] === sourceType).length;
+                console.log(`   ${sourceType} → ${targetType} (${count} work items)`);
+            });
+        }
         console.log(`Use default values for missing fields: ${copyConfig.useDefaultValues ? 'Yes' : 'No'}`);
-        console.log(`Add missing users as stakeholders: ${copyConfig.addMissingUsers ? 'Yes' : 'No'}\n`);
+        const userAccessLevelDisplay = copyConfig.userAccessLevel === 'none' ? 'Do not add' : 
+                                     copyConfig.userAccessLevel === 'basic' ? 'Add as Basic users' : 
+                                     'Add as Stakeholders';
+        console.log(`Missing users handling: ${userAccessLevelDisplay}\n`);
 
         const { confirm } = await inquirer.prompt([
             {
@@ -1402,51 +1478,51 @@ async function copyEpicAndChildren(): Promise<void> {
         const totalCount = workItemsToProcess.length;
 
         for (const workItem of workItemsToProcess) {
-            const workItemType = workItem.fields['System.WorkItemType'];
+            const originalWorkItemType = workItem.fields['System.WorkItemType'];
+            const targetWorkItemType = copyConfig.typeMappings.get(originalWorkItemType) || originalWorkItemType;
             processedCount++;
-            
-            if (copyConfig.skipMissingTypes && !targetTypeNames.has(workItemType)) {
-                console.log(`⏭️  [${processedCount}/${totalCount}] Skipping ${workItem.fields['System.Title']} (${workItemType}) - type not found in target`);
-                continue;
-            }
 
             try {
-                console.log(`📝 [${processedCount}/${totalCount}] Copying: ${workItem.fields['System.Title']} (${workItemType})`);
+                if (originalWorkItemType !== targetWorkItemType) {
+                    console.log(`📝 [${processedCount}/${totalCount}] Copying: ${workItem.fields['System.Title']} (${originalWorkItemType} → ${targetWorkItemType})`);
+                } else {
+                    console.log(`📝 [${processedCount}/${totalCount}] Copying: ${workItem.fields['System.Title']} (${originalWorkItemType})`);
+                }
                 
-                // Get or cache detailed work item type with field instances
-                if (!detailedTypes[workItemType]) {
-                    const typeTimer = startProgress(`   🔍 Fetching detailed type info for ${workItemType}`);
+                // Get or cache detailed work item type with field instances (using target type)
+                if (!detailedTypes[targetWorkItemType]) {
+                    const typeTimer = startProgress(`   🔍 Fetching detailed type info for ${targetWorkItemType}`);
                     try {
-                        detailedTypes[workItemType] = await getWorkItemTypeDetails(
+                        detailedTypes[targetWorkItemType] = await getWorkItemTypeDetails(
                             copyConfig.targetOrg, 
                             copyConfig.targetProject, 
-                            workItemType
+                            targetWorkItemType
                         );
-                        stopProgress(typeTimer, `   ✓ Fetched detailed type info for ${workItemType}`);
+                        stopProgress(typeTimer, `   ✓ Fetched detailed type info for ${targetWorkItemType}`);
                     } catch (error) {
-                        stopProgress(typeTimer, `   ⚠️  Could not fetch detailed type info for ${workItemType}`);
+                        stopProgress(typeTimer, `   ⚠️  Could not fetch detailed type info for ${targetWorkItemType}`);
                         console.warn('   Error details:', error);
                         // Fallback to basic type
-                        detailedTypes[workItemType] = targetTypes.find(t => t.name === workItemType)!;
+                        detailedTypes[targetWorkItemType] = targetTypes.find(t => t.name === targetWorkItemType)!;
                     }
                 }
                 
-                const targetType = detailedTypes[workItemType];
+                const targetType = detailedTypes[targetWorkItemType];
                 
-                // Get or cache state model for this work item type
-                if (!stateModels[workItemType]) {
-                    const stateTimer = startProgress(`   🔍 Fetching states for ${workItemType}`);
+                // Get or cache state model for this work item type (using target type)
+                if (!stateModels[targetWorkItemType]) {
+                    const stateTimer = startProgress(`   🔍 Fetching states for ${targetWorkItemType}`);
                     try {
-                        stateModels[workItemType] = await getWorkItemTypeStates(
+                        stateModels[targetWorkItemType] = await getWorkItemTypeStates(
                             copyConfig.targetOrg, 
                             copyConfig.targetProject, 
-                            workItemType
+                            targetWorkItemType
                         );
-                        stopProgress(stateTimer, `   ✓ Fetched states for ${workItemType}`);
+                        stopProgress(stateTimer, `   ✓ Fetched states for ${targetWorkItemType}`);
                     } catch (error) {
-                        stopProgress(stateTimer, `   ⚠️  Could not fetch states for ${workItemType}`);
+                        stopProgress(stateTimer, `   ⚠️  Could not fetch states for ${targetWorkItemType}`);
                         console.warn('   Error details:', error);
-                        stateModels[workItemType] = { states: [], transitions: {} };
+                        stateModels[targetWorkItemType] = { states: [], transitions: {} };
                     }
                 }
                 
@@ -1456,16 +1532,28 @@ async function copyEpicAndChildren(): Promise<void> {
                     copyConfig.useDefaultValues,
                     targetFieldDefinitions,
                     copyConfig.targetOrg,
-                    stateModels[workItemType]
+                    stateModels[targetWorkItemType]
                 );
                 
-                // Process identity fields if user opted to add missing users
-                if (copyConfig.addMissingUsers) {
+                // Process identity fields based on user access level preference
+                const shouldAddUsers = copyConfig.userAccessLevel !== 'none';
+                if (shouldAddUsers) {
                     const processedFields = await processIdentityFields(
                         mappingResult.fields,
                         copyConfig.targetOrg,
-                        true,
-                        targetFieldDefinitions
+                        shouldAddUsers,
+                        targetFieldDefinitions,
+                        copyConfig.userAccessLevel
+                    );
+                    Object.assign(mappingResult.fields, processedFields);
+                } else {
+                    // If not adding users, remove identity fields
+                    const processedFields = await processIdentityFields(
+                        mappingResult.fields,
+                        copyConfig.targetOrg,
+                        false,
+                        targetFieldDefinitions,
+                        'none'
                     );
                     Object.assign(mappingResult.fields, processedFields);
                 }
@@ -1473,7 +1561,7 @@ async function copyEpicAndChildren(): Promise<void> {
                 const newWorkItem = await createWorkItem(
                     copyConfig.targetOrg,
                     copyConfig.targetProject,
-                    workItemType,
+                    targetWorkItemType,
                     mappingResult.fields,
                     mappingResult.includeStateInCreation || false
                 );
