@@ -466,7 +466,21 @@ async function getWorkItemTypes(org: string, project: string): Promise<WorkItemT
     return body.value;
 }
 
-// Get all work item field definitions
+// Get all work item field definitions for a specific work item type with expanded field information
+async function getWorkItemTypeFields(org: string, project: string, workItemTypeName: string): Promise<WorkItemFieldInstance[]> {
+    const headers = await getHeaders(org);
+    const url = new URL(`https://dev.azure.com/${org}/${project}/_apis/wit/workitemtypes/${encodeURIComponent(workItemTypeName)}/fields`);
+    url.searchParams.set('$expand', 'all');
+    url.searchParams.set('api-version', '7.2-preview.3');
+
+    const res = await fetch(url, { headers });
+    if (!res.ok) throw new Error(`Get work item type fields (${org}/${project}/${workItemTypeName}): ${res.statusText}`);
+
+    const body = await res.json();
+    return body.value || [];
+}
+
+// Get all work item field definitions (fallback method)
 async function getWorkItemFields(org: string, project: string): Promise<WorkItemFieldDefinition[]> {
     const headers = await getHeaders(org);
     const url = new URL(`https://dev.azure.com/${org}/${project}/_apis/wit/fields`);
@@ -498,6 +512,108 @@ async function getPicklistValues(org: string, picklistId: string): Promise<strin
         console.warn(`Warning: Error fetching picklist values for ${picklistId}:`, error);
         return [];
     }
+}
+
+// Get process information for a project
+async function getProjectProcess(org: string, project: string): Promise<{ id: string, typeId: string }> {
+    const headers = await getHeaders(org);
+    const url = new URL(`https://dev.azure.com/${org}/_apis/projects/${encodeURIComponent(project)}`);
+    url.searchParams.set('includeCapabilities', 'true');
+    url.searchParams.set('api-version', '7.1');
+
+    const res = await fetch(url, { headers });
+    if (!res.ok) {
+        console.log(`Url: ${url.toString()}`);
+        throw new Error(`Get project process (${org}/${project}): ${res.statusText}`);
+    }
+
+    const body = await res.json();
+    
+    // Extract process information from project capabilities
+    if (!body.capabilities || !body.capabilities.processTemplate) {
+        throw new Error(`No process template information found for project ${project}`);
+    }
+    
+    const processTemplate = body.capabilities.processTemplate;
+    
+    return {
+        id: processTemplate.templateTypeId,
+        typeId: processTemplate.templateTypeId
+    };
+}
+
+// Add allowed value to a work item type field
+async function addAllowedValueToField(
+    org: string, 
+    project: string,
+    processId: string,
+    witRefName: string, 
+    fieldRefName: string, 
+    currentAllowedValues: string[],
+    newValue: string
+): Promise<boolean> {
+    const headers = await getHeadersJson(org);
+    const url = new URL(`https://dev.azure.com/${org}/_apis/work/processes/${processId}/workItemTypes/${encodeURIComponent(witRefName)}/fields/${encodeURIComponent(fieldRefName)}`);
+    url.searchParams.set('api-version', '7.2-preview.2');
+
+    // Create updated allowed values array with the new value
+    const updatedAllowedValues = [...currentAllowedValues];
+    if (!updatedAllowedValues.includes(newValue)) {
+        updatedAllowedValues.push(newValue);
+    }
+
+    const payload = {
+        allowedValues: updatedAllowedValues
+    };
+
+    try {
+        const res = await fetch(url, {
+            method: 'PATCH',
+            headers,
+            body: JSON.stringify(payload)
+        });
+
+        if (res.ok) {
+            console.log(`   ✅ Added "${newValue}" to allowed values for field ${fieldRefName} in work item type ${witRefName}`);
+            return true;
+        } else {
+            const errorText = await res.text();
+            console.warn(`   ⚠️  Could not add "${newValue}" to field ${fieldRefName}: ${res.status} ${errorText}`);
+            return false;
+        }
+    } catch (error) {
+        console.warn(`   ⚠️  Error adding "${newValue}" to field ${fieldRefName}:`, error);
+        return false;
+    }
+}
+
+// Find the closest numeric value from a list of allowed values
+function findClosestNumericValue(sourceValue: any, allowedValues: any[]): any | null {
+    const sourceNum = parseFloat(sourceValue);
+    if (isNaN(sourceNum)) return null;
+
+    // Filter and convert allowed values to numbers
+    const numericAllowed = allowedValues
+        .map(val => parseFloat(val))
+        .filter(num => !isNaN(num));
+
+    if (numericAllowed.length === 0) return null;
+
+    // Find the closest number
+    let closest = numericAllowed[0]!; // We know length > 0 from check above
+    let minDiff = Math.abs(sourceNum - closest);
+
+    for (const num of numericAllowed) {
+        const diff = Math.abs(sourceNum - num);
+        if (diff < minDiff) {
+            minDiff = diff;
+            closest = num;
+        }
+    }
+
+    // Return the original format (string or number) that matches the closest value
+    const closestIndex = allowedValues.findIndex(val => parseFloat(val) === closest);
+    return closestIndex >= 0 ? allowedValues[closestIndex] : closest;
 }
 
 // Get detailed work item type with field instances
@@ -923,13 +1039,16 @@ function getDefaultValue(field: WorkItemFieldInstance, fieldDefinitions: WorkIte
     return 'TBD';
 }
 
-// Validate and sanitize field value based on field constraints
+// Validate and sanitize field value based on field constraints with enhanced allowed values handling
 async function validateFieldValue(
     fieldRef: string, 
     sourceValue: any, 
-    targetWorkItemType: WorkItemType, 
+    targetField: WorkItemFieldInstance,
     fieldDefinitions: WorkItemFieldDefinition[],
-    org: string
+    org: string,
+    project: string,
+    processId: string,
+    witRefName: string
 ): Promise<any> {
     // Find the field definition to get comprehensive field information
     const fieldDef = fieldDefinitions.find(f => f.referenceName === fieldRef);
@@ -939,49 +1058,20 @@ async function validateFieldValue(
         console.log(`   🔍 Field "${fieldRef}": is identity field, will be processed separately`);
         return sourceValue; // Identity fields are processed in processIdentityFields
     }
-    
-    // Find the field in the target work item type to get the actual allowed values
-    let targetField: WorkItemFieldInstance | undefined;
-    
-    // Look in fieldInstances first (more detailed)
-    if (targetWorkItemType.fieldInstances) {
-        targetField = targetWorkItemType.fieldInstances.find(f => 
-            f.referenceName === fieldRef || f.field?.referenceName === fieldRef
-        );
-    }
-    
-    // Fallback to fields array
-    if (!targetField && targetWorkItemType.fields) {
-        const fieldDefFromType = targetWorkItemType.fields.find(f => f.referenceName === fieldRef);
-        if (fieldDefFromType) {
-            targetField = {
-                field: fieldDefFromType,
-                referenceName: fieldRef,
-                name: fieldDefFromType.name,
-                allowedValues: fieldDefFromType.allowedValues || [],
-                listValues: fieldDefFromType.suggestedValues || [],
-                defaultValue: fieldDefFromType.defaultValue,
-                alwaysRequired: fieldDefFromType.alwaysRequired,
-                dependentFields: fieldDefFromType.dependentFields || [],
-                helpText: fieldDefFromType.helpText || '',
-                hideWhenNull: false,
-                id: fieldRef,
-                suggestedValues: fieldDefFromType.suggestedValues || [],
-                allowGroups: fieldDefFromType.allowGroups || false,
-                url: fieldDefFromType.url || ''
-            };
-        }
-    }
-    
-    if (!targetField) {
-        console.log(`   ⚠️  Field "${fieldRef}" not found in target work item type, using source value`);
-        return sourceValue;
-    }
 
-    // Check for picklist values if this is a picklist field
-    let allowedValues: string[] = [];
+    // Get allowed values from the target field instance (expanded with detailed field info)
+    let allowedValues: any[] = [];
     
-    if (fieldDef && fieldDef.isPicklist && fieldDef.picklistId) {
+    // Use allowedValues from the expanded field instance first (most accurate)
+    if (targetField.allowedValues && targetField.allowedValues.length > 0) {
+        allowedValues = targetField.allowedValues;
+    } 
+    // Fallback to listValues
+    else if (targetField.listValues && targetField.listValues.length > 0) {
+        allowedValues = targetField.listValues;
+    }
+    // Fallback to picklist values if this is a picklist field
+    else if (fieldDef && fieldDef.isPicklist && fieldDef.picklistId) {
         console.log(`   🔍 Field "${fieldRef}": is picklist field (ID: ${fieldDef.picklistId}), fetching picklist values...`);
         try {
             allowedValues = await getPicklistValues(org, fieldDef.picklistId);
@@ -990,64 +1080,92 @@ async function validateFieldValue(
             console.warn(`   ⚠️  Could not fetch picklist values for field "${fieldRef}":`, error);
         }
     }
-    
-    // Fallback to field instance allowed/suggested values
-    if (allowedValues.length === 0) {
-        allowedValues = targetField.allowedValues && targetField.allowedValues.length > 0 
-            ? targetField.allowedValues 
-            : targetField.listValues && targetField.listValues.length > 0 
-            ? targetField.listValues 
-            : targetField.field?.allowedValues && targetField.field.allowedValues.length > 0
-            ? targetField.field.allowedValues
-            : targetField.field?.suggestedValues && targetField.field.suggestedValues.length > 0
-            ? targetField.field.suggestedValues
-            : [];
-    }
 
-    // If the field has allowed/list values, check if source value is permitted
+    // If the field has allowed values, validate the source value
     if (allowedValues.length > 0) {
-        // Debug logging
-        console.log(`   🔍 Field "${fieldRef}": checking value "${sourceValue}" against allowed values [${allowedValues.join(', ')}]`);
+        console.log(`   🔍 Field "${fieldRef}": checking value "${sourceValue}" against ${allowedValues.length} allowed values`);
         
         // Check if source value is in allowed values (case-insensitive for strings)
         const isAllowed = allowedValues.some(allowed => {
             if (typeof sourceValue === 'string' && typeof allowed === 'string') {
-                return sourceValue.toLowerCase() === allowed.toLowerCase();
+                return sourceValue.toLowerCase() == allowed.toLowerCase();
             }
-            return sourceValue === allowed;
+            return sourceValue == allowed;
         });
         
         if (!isAllowed) {
-            const valueType = fieldDef && fieldDef.isPicklist ? 'picklist' : 'allowed';
-            console.log(`   ⚠️  Field "${fieldRef}": value "${sourceValue}" not in ${valueType} values [${allowedValues.join(', ')}], using default`);
+            console.log('allowedValues:', allowedValues);
+            console.log('sourceValue:', sourceValue);
+            console.log('typeof sourceValue:', typeof sourceValue);
+
+            console.log(`   ⚠️  Field "${fieldRef}": value "${sourceValue}" not in allowed values [${allowedValues.slice(0, 5).join(', ')}${allowedValues.length > 5 ? '...' : ''}]`);
             
-            // Return the first allowed/list value or a field-specific default
-            if (fieldRef === 'Microsoft.VSTS.Common.Priority') {
-                // For priority, use 2 (Medium) if it's in allowed values, otherwise first value
-                const mediumPriority = allowedValues.find(v => 
-                    (typeof v === 'number' && v === 2) || 
-                    (typeof v === 'string' && v === '2')
+            // Determine field type for handling strategy
+            const fieldType = fieldDef?.type || targetField.field?.referenceName || '';
+            const isStringField = typeof sourceValue === 'string' && 
+                                  (fieldType.includes('String') || fieldType.includes('PlainText'));
+            const isNumericField = !isNaN(parseFloat(sourceValue)) && 
+                                   (fieldType.includes('Integer') || fieldType.includes('Double') || fieldType.includes('Decimal'));
+            
+            if (isStringField && allowedValues.length > 0) {
+                // For string fields with allowed values, try to add "Other" value
+                console.log(`   🔄 Attempting to add "Other" value to field "${fieldRef}"`);
+                const added = await addAllowedValueToField(
+                    org, 
+                    project, 
+                    processId, 
+                    witRefName, 
+                    fieldRef, 
+                    allowedValues.map(v => String(v)), 
+                    "Other"
                 );
-                return mediumPriority || allowedValues[0];
-            } else if (fieldRef === 'Microsoft.VSTS.Common.Severity') {
-                // For severity, prefer "3 - Medium" or similar
-                const mediumSeverity = allowedValues.find(v => 
-                    typeof v === 'string' && v.toLowerCase().includes('medium')
-                );
-                return mediumSeverity || allowedValues[0];
-            } else if (fieldRef === 'Microsoft.VSTS.Common.Activity') {
-                // For activity, prefer "Development" or similar
-                const developmentActivity = allowedValues.find(v => 
-                    typeof v === 'string' && v.toLowerCase().includes('development')
-                );
-                return developmentActivity || allowedValues[0];
+                if (added) {
+                    return "Other";
+                } else {
+                    console.log(`   ⚠️  Could not add "Other" value, skipping field "${fieldRef}"`);
+                    return null; // Skip field
+                }
+            } else if (isNumericField) {
+                // For numeric fields, find closest value
+                const closestValue = findClosestNumericValue(sourceValue, allowedValues);
+                if (closestValue !== null) {
+                    console.log(`   🔄 Using closest numeric value "${closestValue}" for field "${fieldRef}" (source: "${sourceValue}")`);
+                    return closestValue;
+                } else {
+                    console.log(`   ⚠️  No numeric values found in allowed values, skipping field "${fieldRef}"`);
+                    return null; // Skip field
+                }
             } else {
-                return allowedValues[0];
+                // For other field types, use field-specific defaults or first allowed value
+                if (fieldRef === 'Microsoft.VSTS.Common.Priority') {
+                    // For priority, use 2 (Medium) if it's in allowed values, otherwise first value
+                    const mediumPriority = allowedValues.find(v => 
+                        (typeof v === 'number' && v === 2) || 
+                        (typeof v === 'string' && v === '2')
+                    );
+                    return mediumPriority || allowedValues[0];
+                } else if (fieldRef === 'Microsoft.VSTS.Common.Severity') {
+                    // For severity, prefer "3 - Medium" or similar
+                    const mediumSeverity = allowedValues.find(v => 
+                        typeof v === 'string' && v.toLowerCase().includes('medium')
+                    );
+                    return mediumSeverity || allowedValues[0];
+                } else if (fieldRef === 'Microsoft.VSTS.Common.Activity') {
+                    // For activity, prefer "Development" or similar
+                    const developmentActivity = allowedValues.find(v => 
+                        typeof v === 'string' && v.toLowerCase().includes('development')
+                    );
+                    return developmentActivity || allowedValues[0];
+                } else {
+                    return allowedValues[0];
+                }
             }
         } else {
             console.log(`   ✅ Field "${fieldRef}": value "${sourceValue}" is valid`);
         }
     }
+    
+    // For fields without allowed values, apply general validation rules
     
     // For specific known fields with numeric constraints
     if (fieldRef === 'Microsoft.VSTS.Common.Priority') {
@@ -1097,13 +1215,16 @@ async function validateFieldValue(
     return sourceValue;
 }
 
-// Map source fields to target fields
+// Map source fields to target fields with enhanced field validation
 async function mapWorkItemFields(
     sourceWorkItem: WorkItem,
-    targetType: WorkItemType,
+    targetWorkItemTypeName: string,
+    targetTypeFields: WorkItemFieldInstance[],
     useDefaults: boolean,
     fieldDefinitions: WorkItemFieldDefinition[],
     org: string,
+    project: string,
+    processId: string,
     stateModel?: WorkItemTypeStateModel
 ): Promise<{ fields: { [key: string]: any }, state?: string, reason?: string, includeStateInCreation?: boolean }> {
     const mappedFields: { [key: string]: any } = {};
@@ -1127,10 +1248,8 @@ async function mapWorkItemFields(
     }
 
     // Map other fields that exist in both source and target
-    const fieldInstances = targetType.fieldInstances || targetType.fields || [];
-    
-    for (const targetField of fieldInstances) {
-        const fieldRef = targetField.referenceName || targetField.field?.referenceName;
+    for (const targetField of targetTypeFields) {
+        const fieldRef = targetField.referenceName;
         
         if (!fieldRef) continue; // Skip if we can't determine the field reference
         
@@ -1162,7 +1281,8 @@ async function mapWorkItemFields(
             fieldRef === 'Microsoft.VSTS.Common.ResolvedDate' ||
             fieldRef === 'Microsoft.VSTS.Common.ResolvedBy' ||
             fieldRef === 'Microsoft.VSTS.Common.ClosedDate' ||
-            fieldRef === 'Microsoft.VSTS.Common.ClosedBy') {
+            fieldRef === 'Microsoft.VSTS.Common.ClosedBy' ||
+            fieldRef === 'System.WorkItemType') {
             continue;
         }
 
@@ -1180,13 +1300,13 @@ async function mapWorkItemFields(
             if (fieldRef === 'System.State' && stateModel) {
                 const sourceState = sourceFields[fieldRef];
                 // Check if the source state exists in target work item type
-                const validState = stateModel.states.find(s => s.name === sourceState);
+                const validState = stateModel.states.find(s => s.name == sourceState);
                 if (validState) {
                     targetState = sourceState;
                     targetReason = getValidStateReason(stateModel, sourceState);
                     
                     // Check if state category is "Proposed" - if so, include in creation
-                    if (validState.stateCategory === 'Proposed') {
+                    if (validState.stateCategory == 'Proposed') {
                         includeStateInCreation = true;
                         mappedFields[fieldRef] = sourceState;
                         mappedFields['System.Reason'] = targetReason;
@@ -1202,7 +1322,7 @@ async function mapWorkItemFields(
                     targetReason = getValidStateReason(stateModel, defaultState);
                     
                     // Check if default state category is "Proposed"
-                    if (defaultStateObj?.stateCategory === 'Proposed') {
+                    if (defaultStateObj?.stateCategory == 'Proposed') {
                         includeStateInCreation = true;
                         mappedFields[fieldRef] = defaultState;
                         mappedFields['System.Reason'] = targetReason;
@@ -1215,8 +1335,20 @@ async function mapWorkItemFields(
                 continue;
             } else {
                 // Validate and sanitize the field value based on target field constraints
-                const validatedValue = await validateFieldValue(fieldRef, sourceFields[fieldRef], targetType, fieldDefinitions, org);
-                mappedFields[fieldRef] = validatedValue;
+                const validatedValue = await validateFieldValue(
+                    fieldRef, 
+                    sourceFields[fieldRef], 
+                    targetField, 
+                    fieldDefinitions, 
+                    org, 
+                    project, 
+                    processId, 
+                    targetWorkItemTypeName
+                );
+                if (validatedValue !== null) {
+                    mappedFields[fieldRef] = validatedValue;
+                }
+                // If validatedValue is null, the field is skipped (not added to mappedFields)
             }
         } else if (targetField.alwaysRequired && useDefaults) {
             // If it's required in target but not present in source, use default
@@ -1550,7 +1682,20 @@ async function copyEpicAndChildren(): Promise<void> {
         
         const copiedItems: { [sourceId: number]: number } = {};
         const stateModels: { [workItemType: string]: WorkItemTypeStateModel } = {};
-        const detailedTypes: { [workItemType: string]: WorkItemType } = {};
+        const detailedTypeFields: { [workItemType: string]: WorkItemFieldInstance[] } = {};
+
+        // Get process information for the target project
+        console.log('🔍 Fetching project process information...');
+        let processId: string;
+        try {
+            const processInfo = await getProjectProcess(copyConfig.targetOrg, copyConfig.targetProject);
+            processId = processInfo.id;
+            console.log(`✓ Found process ID: ${processId}`);
+        } catch (error) {
+            console.error('❌ Could not fetch process information:', error);
+            console.error('💡 This is required for adding allowed values to fields. Continuing without field modification...');
+            processId = ''; // Empty string indicates no process modification capability
+        }
 
         let processedCount = 0;
         const totalCount = workItemsToProcess.length;
@@ -1567,25 +1712,25 @@ async function copyEpicAndChildren(): Promise<void> {
                     console.log(`📝 [${processedCount}/${totalCount}] Copying: ${workItem.fields['System.Title']} (${originalWorkItemType})`);
                 }
                 
-                // Get or cache detailed work item type with field instances (using target type)
-                if (!detailedTypes[targetWorkItemType]) {
-                    const typeTimer = startProgress(`   🔍 Fetching detailed type info for ${targetWorkItemType}`);
+                // Get or cache detailed work item type fields with expanded information (using target type)
+                if (!detailedTypeFields[targetWorkItemType]) {
+                    const typeTimer = startProgress(`   🔍 Fetching detailed field info for ${targetWorkItemType}`);
                     try {
-                        detailedTypes[targetWorkItemType] = await getWorkItemTypeDetails(
+                        detailedTypeFields[targetWorkItemType] = await getWorkItemTypeFields(
                             copyConfig.targetOrg, 
                             copyConfig.targetProject, 
                             targetWorkItemType
                         );
-                        stopProgress(typeTimer, `   ✓ Fetched detailed type info for ${targetWorkItemType}`);
+                        stopProgress(typeTimer, `   ✓ Fetched ${detailedTypeFields[targetWorkItemType].length} fields for ${targetWorkItemType}`);
                     } catch (error) {
-                        stopProgress(typeTimer, `   ⚠️  Could not fetch detailed type info for ${targetWorkItemType}`);
+                        stopProgress(typeTimer, `   ⚠️  Could not fetch detailed field info for ${targetWorkItemType}`);
                         console.warn('   Error details:', error);
-                        // Fallback to basic type
-                        detailedTypes[targetWorkItemType] = targetTypes.find(t => t.name === targetWorkItemType)!;
+                        // Fallback to empty array
+                        detailedTypeFields[targetWorkItemType] = [];
                     }
                 }
                 
-                const targetType = detailedTypes[targetWorkItemType];
+                const targetTypeFields = detailedTypeFields[targetWorkItemType];
                 
                 // Get or cache state model for this work item type (using target type)
                 if (!stateModels[targetWorkItemType]) {
@@ -1606,10 +1751,13 @@ async function copyEpicAndChildren(): Promise<void> {
                 
                 const mappingResult = await mapWorkItemFields(
                     workItem, 
-                    targetType, 
+                    targetWorkItemType,
+                    targetTypeFields,
                     copyConfig.useDefaultValues,
                     targetFieldDefinitions,
                     copyConfig.targetOrg,
+                    copyConfig.targetProject,
+                    processId,
                     stateModels[targetWorkItemType]
                 );
                 
