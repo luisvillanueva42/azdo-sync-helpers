@@ -78,7 +78,59 @@ npm run copy-projects
 5. Review summary and confirm
 6. Projects are created in the target organization
 
-### 3. Migrate Process
+### 3. Copy Work Items
+
+Interactive tool to copy an Epic and all its child work items from one organization to another with enhanced field validation and identity management.
+
+```powershell
+npm run copy-workitems
+```
+
+**Features**:
+- Copy entire Epic hierarchies with all child work items
+- Advanced field validation with allowed values handling
+- Automatic identity field error handling and retry logic
+- Smart field value mapping between organizations
+- Work item type mapping for missing types
+- Automatic user management (add as stakeholders/basic users)
+- Batch processing for large work item sets
+- Progress tracking and detailed logging
+
+**Enhanced Field Handling**:
+- **String fields with allowed values**: Automatically adds "Other" value when source value isn't allowed
+- **Numeric fields**: Finds closest matching value from allowed values
+- **Identity fields**: Handles unknown identities by retrying without problematic fields
+- **Work item type fields**: Fetches detailed field information with expanded allowed values
+
+**Workflow**:
+1. Select source and target organizations and projects
+2. Enter Epic ID to copy (with all children)
+3. Handle missing work item types (skip or map to existing types)
+4. Configure default value usage and user access levels
+5. Review summary and confirm
+6. Work items are created with proper field validation and relationships
+
+### 4. Copy Work Item Type
+
+Tool to copy work item type definitions between projects.
+
+```powershell
+npm run copy-workitemtype
+```
+
+**Use case**: Copy custom work item type definitions to maintain consistency across projects.
+
+### 5. Change Work Item Types
+
+Tool to bulk change work item types within a project.
+
+```powershell
+npm run change-workitem-types
+```
+
+**Use case**: Convert existing work items from one type to another (e.g., Task to User Story).
+
+### 6. Migrate Process
 
 Interactive tool to migrate a process template from one organization to another.
 
@@ -134,7 +186,30 @@ npm run migrate-process
 # - Run the process migrator to perform the migration
 ```
 
-### Example 3: Recreate Existing Projects
+### Example 3: Copy Work Items with Enhanced Field Handling
+
+```powershell
+npm run copy-workitems
+
+# Follow prompts:
+# 1. Select source: STMN-Group / Project A
+# 2. Select target: STMN-Group-DEV / Project B
+# 3. Enter Epic ID: 12345
+# 4. Handle missing work item types (map Task to User Story)
+# 5. Configure field defaults: Yes
+# 6. User handling: Add as Stakeholders
+# 7. Review summary showing field mappings and user additions
+
+# The tool will:
+# - Copy Epic 12345 and all its children
+# - Handle field validation automatically
+# - Add "Other" values for incompatible string fields
+# - Find closest numeric values for number fields
+# - Retry creation if identity fields fail
+# - Maintain parent-child relationships
+```
+
+### Example 4: Recreate Existing Projects
 
 ```powershell
 npm run copy-projects
@@ -152,6 +227,8 @@ Your PAT needs the following permissions:
 - **Project and Team**: Read, Write, & Manage
 - **Work Items**: Read & Write
 - **Process**: Read & Write (for process migration)
+- **Member Entitlement Management**: Read & Write (for adding users to organizations)
+- **Identity**: Read (for user identity validation)
 
 ### Dry-Run Mode
 
@@ -166,6 +243,32 @@ The `process-migrator-configuration.json` file supports comments using `//`. Thi
 - Process templates must exist in the target organization before copying projects
 - The tool attempts to match process templates by name
 - If no match is found, the default process template is used
+
+### Work Item Field Validation
+
+The copy-workitems tool includes advanced field validation:
+
+**Allowed Values Handling**:
+- Fetches detailed field information with `$expand=all` for accurate validation
+- For string fields: Automatically adds "Other" value when source value isn't in target's allowed values
+- For numeric fields: Finds the closest matching value from target's allowed values
+- For other field types: Uses intelligent defaults or first allowed value
+
+**Identity Field Management**:
+- Detects identity field errors (unknown users in target organization)
+- Automatically retries work item creation without problematic identity fields
+- Can optionally add missing users as Stakeholders or Basic users
+- Preserves work item creation even when identity validation fails
+
+**Work Item Type Mapping**:
+- Handles missing work item types by allowing mapping to existing types
+- Maintains field compatibility during type conversion
+- Provides interactive selection for type mappings
+
+**Batch Processing**:
+- Splits large work item requests into batches of 190 items (under Azure DevOps 200 limit)
+- Shows progress indicators for large hierarchies
+- Maintains performance for Epic trees with hundreds of work items
 
 ## Troubleshooting
 
@@ -185,3 +288,24 @@ The `process-migrator-configuration.json` file supports comments using `//`. Thi
 - Ensure the `process-migrator` CLI tool is installed globally
 - Check that the configuration file is valid
 - Verify process names exist in source organization
+
+### Work item copying issues
+
+**"Identity field error" or "unknown identity"**:
+- This is automatically handled by the retry logic
+- Check if users exist in the target organization
+- Consider using "Add as Stakeholders" option to automatically add missing users
+
+**"Field value not allowed" errors**:
+- The tool automatically handles this by adding "Other" values or finding closest matches
+- Ensure you have Process permissions to modify field allowed values
+- Check that the process ID is correctly retrieved from the target project
+
+**"Work item type not found"**:
+- Use the type mapping feature to map missing types to existing ones
+- Consider migrating the process template first to ensure all work item types exist
+
+**Large Epic hierarchies taking too long**:
+- The tool processes in batches automatically
+- Monitor progress indicators - processing hundreds of work items can take several minutes
+- Network timeouts may occur - retry the operation if needed
